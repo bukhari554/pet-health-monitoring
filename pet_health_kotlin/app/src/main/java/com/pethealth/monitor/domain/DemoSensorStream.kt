@@ -38,6 +38,7 @@ class DemoSensorStream(private val petId: String) {
         val forceFall = tick % 70 == 35
         val forceCollarOff = tick % 90 == 50
 
+        // Build vectors first, then derive motion energy = |‖a‖ − g| (same as ESP).
         var ax = 0.2f + random.nextFloat() * 0.4f
         var ay = 0.1f + random.nextFloat() * 0.3f
         var az = 9.6f + (random.nextFloat() - 0.5f) * 0.4f
@@ -45,30 +46,34 @@ class DemoSensorStream(private val petId: String) {
         val gy = (random.nextFloat() - 0.5f) * 0.3f
         val gz = (random.nextFloat() - 0.5f) * 0.3f
         var jerk = 0.5f + random.nextFloat()
-        var accelEnergy = 0.8f + random.nextFloat()
         var gyroEnergy = 0.2f + random.nextFloat() * 0.4f
 
         when (activity) {
             ActivityClass.STANDING -> {
                 ay = 9.6f + (random.nextFloat() - 0.5f) * 0.3f
                 az = 0.4f + random.nextFloat() * 0.4f
+                ax = 0.2f + random.nextFloat() * 0.3f
+                gyroEnergy = 0.15f + random.nextFloat() * 0.2f
                 standing++
             }
             ActivityClass.LAYING -> {
                 az = 9.5f + (random.nextFloat() - 0.5f) * 0.3f
                 ax = 0.3f + random.nextFloat() * 0.5f
+                ay = 0.2f + random.nextFloat() * 0.3f
+                gyroEnergy = 0.2f + random.nextFloat() * 0.25f
                 laying++
             }
             ActivityClass.SLEEPING -> {
-                az = 9.4f + (random.nextFloat() - 0.5f) * 0.2f
-                accelEnergy = 0.3f + random.nextFloat() * 0.3f
-                gyroEnergy = 0.1f + random.nextFloat() * 0.15f
+                az = 9.4f + (random.nextFloat() - 0.5f) * 0.15f
+                ax = 0.15f + random.nextFloat() * 0.2f
+                ay = 0.1f + random.nextFloat() * 0.2f
+                gyroEnergy = 0.05f + random.nextFloat() * 0.1f
                 sleeping++
             }
             ActivityClass.WALKING -> {
                 ax = 2f + random.nextFloat() * 2f
-                ay = 1f + random.nextFloat()
-                accelEnergy = 4f + random.nextFloat() * 3f
+                ay = 8f + random.nextFloat()
+                az = 3f + random.nextFloat()
                 gyroEnergy = 1.5f + random.nextFloat()
                 jerk = 2f + random.nextFloat() * 2f
                 movement += 2
@@ -76,8 +81,8 @@ class DemoSensorStream(private val petId: String) {
             }
             ActivityClass.PLAYING -> {
                 ax = 4f + random.nextFloat() * 4f
-                ay = 3f + random.nextFloat() * 3f
-                accelEnergy = 12f + random.nextFloat() * 8f
+                ay = 6f + random.nextFloat() * 3f
+                az = 5f + random.nextFloat() * 3f
                 gyroEnergy = 5f + random.nextFloat() * 4f
                 jerk = 6f + random.nextFloat() * 5f
                 movement += 5
@@ -86,9 +91,18 @@ class DemoSensorStream(private val petId: String) {
             ActivityClass.UNKNOWN -> Unit
         }
 
+        var accelEnergy = kotlin.math.abs(
+            kotlin.math.sqrt(ax * ax + ay * ay + az * az) - 9.81f
+        )
+
         if (forceFall) {
             jerk = 22f + random.nextFloat() * 5f
-            accelEnergy = 40f
+            ax = 20f
+            ay = 5f
+            az = 5f
+            accelEnergy = kotlin.math.abs(
+                kotlin.math.sqrt(ax * ax + ay * ay + az * az) - 9.81f
+            )
             gx = 8f
         }
 
@@ -103,7 +117,8 @@ class DemoSensorStream(private val petId: String) {
         if (forceCollarOff) {
             quality = 0.05f
             artifact = true
-            accelEnergy = 0.2f
+            accelEnergy = 0.15f
+            gyroEnergy = 0.05f
         }
 
         val resting = activity == ActivityClass.SLEEPING || activity == ActivityClass.LAYING
@@ -148,7 +163,7 @@ class DemoSensorStream(private val petId: String) {
             heartRateBpm = bpm,
             hrvRmssdMs = hrv,
             signalQuality = quality.coerceIn(0f, 1f),
-            restingHeartRate = if (resting && bpm > 0) bpm else 78,
+            restingHeartRate = if (resting && bpm > 0) bpm else null,
             artifactRejected = artifact,
             activity = activity,
             movementCount = movement,

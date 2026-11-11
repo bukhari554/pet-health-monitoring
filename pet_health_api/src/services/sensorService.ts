@@ -71,7 +71,10 @@ export async function ingestReading(input: SensorIngestInput) {
     createdAlerts.push(row.rows[0]);
   }
 
-  const score = computeHealthScore(input, openCount + createdAlerts.length);
+  const score = computeHealthScore(input, openCount + createdAlerts.length, {
+    highRestingHr: baseline.highRestingHrThreshold,
+    lowHrv: baseline.lowHrvThreshold,
+  });
   await query(
     `INSERT INTO health_scores (pet_id, score, label, reasons)
      VALUES ($1,$2,$3,$4::jsonb)`,
@@ -165,8 +168,9 @@ async function upsertDailySummary(
       s.active_minutes,
       s.laying_minutes,
       s.standing_minutes,
-      s.sleeping_minutes > 300 ? 2 : 1,
-      Math.min(40, Math.max(5, Math.round(Number(s.accel_energy) * 3))),
+      // Awakenings / restless are soft estimates from activity shifts, not invented from gravity energy
+      Number(s.active_minutes) > 30 ? 2 : 1,
+      Math.min(40, Math.max(0, Math.round(Number(s.active_minutes) * 0.15))),
       sleepScore,
       Number(avg.rows[0].avg_bpm),
       Number(avg.rows[0].avg_resting),

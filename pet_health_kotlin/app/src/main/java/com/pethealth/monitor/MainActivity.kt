@@ -186,13 +186,11 @@ private fun PetHealthApp(vm: PetHealthViewModel = viewModel()) {
                     SettingsScreen(
                         demoMode = state.demoMode,
                         apiOnline = state.apiOnline,
-                        baseUrl = state.baseUrl,
                         statusMessage = state.statusMessage,
                         baseline = state.baseline,
                         device = state.device,
                         ble = state.ble,
                         onDemoMode = vm::setDemoMode,
-                        onSaveBaseUrl = vm::setBaseUrl,
                         onRefreshBaseline = vm::refreshBaseline,
                         onBleScan = vm::bleScan,
                         onBleStopScan = vm::bleStopScan,

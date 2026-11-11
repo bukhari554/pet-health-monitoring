@@ -26,7 +26,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -97,8 +96,14 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
     fun bleStopScan() = ble.stopScan()
     fun bleConnect(address: String) = ble.connect(address)
     fun bleDisconnect() = ble.disconnect()
-    fun bleProvision(ssid: String, password: String, brokerHost: String) =
-        ble.provision(ssid, password, brokerHost)
+    fun bleProvision(ssid: String, password: String) {
+        val brokerHost = _state.value.mqttUrl
+            .removePrefix("mqtt://")
+            .removePrefix("mqtts://")
+            .substringBefore(':')
+            .substringBefore('/')
+        ble.provision(ssid, password, brokerHost, _state.value.baseUrl)
+    }
 
     override fun onCleared() {
         ble.release()
@@ -132,7 +137,9 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
                 val alerts = s.alerts.map {
                     if (it.id == id) it.copy(isAcknowledged = true) else it
                 }
-                recomputeLocal(s.copy(alerts = alerts))
+                // Live mode: only flip ack flags — keep API score/journal intact.
+                if (!s.demoMode && s.apiOnline) s.copy(alerts = alerts)
+                else recomputeLocal(s.copy(alerts = alerts))
             }
         }
     }
@@ -144,7 +151,9 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching { api.acknowledgeAll(petId) }
             }
             _state.update { s ->
-                recomputeLocal(s.copy(alerts = s.alerts.map { it.copy(isAcknowledged = true) }))
+                val alerts = s.alerts.map { it.copy(isAcknowledged = true) }
+                if (!s.demoMode && s.apiOnline) s.copy(alerts = alerts)
+                else recomputeLocal(s.copy(alerts = alerts))
             }
         }
     }
@@ -238,14 +247,13 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
             } catch (_: Exception) {
+                // Keep last live reading; do not inject demo vitals over real data.
                 _state.update {
                     it.copy(
                         apiOnline = false,
-                        statusMessage = "API unreachable · demo fallback sample"
+                        statusMessage = "API unreachable · last live reading kept"
                     )
                 }
-                val sample = DemoSensorStream(petId).readings(intervalMs = 1).first()
-                applyDemoReading(sample)
             }
             delay(2000)
         }
@@ -265,7 +273,7 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
             maybeNotify(newAlerts)
             val alerts = (newAlerts + s.alerts).take(50)
             val open = alerts.count { !it.isAcknowledged }
-            val score = scoreService.compute(reading, open)
+            val score = scoreService.compute(reading, open, s.baseline)
             val week = journal.buildWeek(reading, open, score.score)
             s.copy(
                 latest = reading,
@@ -288,7 +296,7 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
     private fun recomputeLocal(s: UiState): UiState {
         val latest = s.latest ?: return s
         val open = s.alerts.count { !it.isAcknowledged }
-        val score = scoreService.compute(latest, open)
+        val score = scoreService.compute(latest, open, s.baseline)
         val week = journal.buildWeek(latest, open, score.score)
         return s.copy(healthScore = score, week = week)
     }

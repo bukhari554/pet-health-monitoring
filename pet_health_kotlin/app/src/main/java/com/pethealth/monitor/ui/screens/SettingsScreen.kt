@@ -11,8 +11,14 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
@@ -26,47 +32,39 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.pethealth.monitor.ble.BleLinkState
-import com.pethealth.monitor.data.ApiConfig
 import com.pethealth.monitor.data.DeviceConnectivity
 import com.pethealth.monitor.data.PetBaseline
 import com.pethealth.monitor.ui.theme.Amber
 import com.pethealth.monitor.ui.theme.Coral
 import com.pethealth.monitor.ui.theme.Forest
 import com.pethealth.monitor.ui.theme.Ink
-import com.pethealth.monitor.ui.theme.Leaf
 import com.pethealth.monitor.ui.theme.Sky
 
 @Composable
 fun SettingsScreen(
     demoMode: Boolean,
     apiOnline: Boolean,
-    baseUrl: String,
     statusMessage: String,
     baseline: PetBaseline?,
     device: DeviceConnectivity?,
     ble: BleLinkState,
     onDemoMode: (Boolean) -> Unit,
-    onSaveBaseUrl: (String) -> Unit,
     onRefreshBaseline: () -> Unit,
     onBleScan: () -> Unit,
     onBleStopScan: () -> Unit,
     onBleConnect: (String) -> Unit,
     onBleDisconnect: () -> Unit,
-    onBleProvision: (ssid: String, pass: String, host: String) -> Unit
+    onBleProvision: (ssid: String, pass: String) -> Unit
 ) {
-    var urlDraft by remember(baseUrl) { mutableStateOf(baseUrl) }
     var ssid by remember { mutableStateOf("") }
     var wifiPass by remember { mutableStateOf("") }
-    var brokerHost by remember {
-        mutableStateOf(
-            ApiConfig.DEFAULT_MQTT_URL
-                .removePrefix("mqtt://")
-                .substringBefore(':')
-        )
-    }
+    var showWifiPass by remember { mutableStateOf(false) }
 
     Column(
         Modifier
@@ -84,9 +82,9 @@ fun SettingsScreen(
         )
 
         Spacer(Modifier.height(20.dp))
-        Text("Connectivity (GlucoTouch-style)", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        Text("Connectivity", fontWeight = FontWeight.Bold, fontSize = 18.sp)
         Text(
-            "Phone BLE → device WiFi creds → MQTT cloud",
+            "Connect collar over Bluetooth, then share your Wi‑Fi",
             fontSize = 12.sp,
             color = Ink.copy(alpha = 0.6f)
         )
@@ -116,19 +114,19 @@ fun SettingsScreen(
                 fontSize = 20.sp
             )
             Spacer(Modifier.height(6.dp))
-            Text("Path: BLE → WiFi → MQTT", fontSize = 12.sp, color = Ink.copy(alpha = 0.6f))
-            Text("Serial: ${device?.serial ?: ApiConfig.DEVICE_SERIAL}", fontSize = 13.sp)
-            Text("BLE: ${ble.message}", fontSize = 13.sp)
-            Text("MQTT: ${if (device?.mqttUp == true || ble.mqtt) "up" else "down"}", fontSize = 13.sp)
-            Text("WiFi RSSI: ${device?.wifiRssi?.toString() ?: "--"} dBm", fontSize = 13.sp)
-            Text("Firmware: ${device?.firmware ?: "--"}", fontSize = 13.sp)
+            Text("Status: ${ble.message}", fontSize = 13.sp)
+            Text(
+                "Link: ${if (device?.mqttUp == true || ble.mqtt) "cloud up" else if (ble.wifi || device?.online == true) "wifi only" else "waiting"}",
+                fontSize = 13.sp
+            )
+            Text("Signal: ${device?.wifiRssi?.toString() ?: "--"} dBm", fontSize = 13.sp)
             Text("Last seen: ${device?.lastSeen ?: "--"}", fontSize = 13.sp)
         }
 
         Spacer(Modifier.height(16.dp))
-        Text("BLE provision device", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        Text("Set up device Wi‑Fi", fontWeight = FontWeight.Bold, fontSize = 16.sp)
         Text(
-            "Scan PetHealth-*, connect, send WiFi + PC broker IP",
+            "Scan → tap your collar → wait until ready → Apply",
             fontSize = 12.sp,
             color = Ink.copy(alpha = 0.6f)
         )
@@ -173,7 +171,7 @@ fun SettingsScreen(
             onValueChange = { ssid = it },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
-            label = { Text("WiFi SSID") }
+            label = { Text("Wi‑Fi name (SSID)") }
         )
         Spacer(Modifier.height(8.dp))
         OutlinedTextField(
@@ -181,56 +179,45 @@ fun SettingsScreen(
             onValueChange = { wifiPass = it },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
-            label = { Text("WiFi password") }
-        )
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = brokerHost,
-            onValueChange = { brokerHost = it },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            label = { Text("Broker / PC IP") },
-            supportingText = { Text("e.g. 192.168.1.14  (MQTT :1883, API :3000)") }
+            label = { Text("Wi‑Fi password") },
+            visualTransformation = if (showWifiPass) {
+                VisualTransformation.None
+            } else {
+                PasswordVisualTransformation()
+            },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            trailingIcon = {
+                IconButton(onClick = { showWifiPass = !showWifiPass }) {
+                    Icon(
+                        imageVector = if (showWifiPass) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                        contentDescription = if (showWifiPass) "Hide password" else "Show password"
+                    )
+                }
+            }
         )
         Spacer(Modifier.height(8.dp))
         Button(
-            onClick = { onBleProvision(ssid.trim(), wifiPass, brokerHost.trim()) },
-            enabled = ble.connectedAddress != null && ssid.isNotBlank() && !ble.busy,
+            onClick = { onBleProvision(ssid.trim(), wifiPass) },
+            enabled = ble.ready && ssid.isNotBlank() && !ble.busy,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(if (ble.busy) "Provisioning…" else "Apply over BLE")
+            Text(
+                when {
+                    ble.busy -> "Provisioning…"
+                    !ble.ready -> "Wait for BLE ready…"
+                    else -> "Apply over BLE"
+                }
+            )
         }
-
-        Spacer(Modifier.height(12.dp))
-        Text("Quick reference", fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(6.dp))
-        Text("REST: $baseUrl", fontSize = 12.sp, color = Sky)
-        Text("MQTT TCP: ${ApiConfig.DEFAULT_MQTT_URL}", fontSize = 12.sp, color = Sky)
-        Text("Device advertises: PetHealth-${ApiConfig.DEVICE_SERIAL}", fontSize = 12.sp, color = Leaf)
 
         Spacer(Modifier.height(20.dp))
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("Demo stream", fontWeight = FontWeight.SemiBold)
-                Text("Offline simulation without Fastify", fontSize = 12.sp, color = Ink.copy(alpha = 0.6f))
+                Text("Offline simulation without live backend", fontSize = 12.sp, color = Ink.copy(alpha = 0.6f))
             }
             Switch(checked = demoMode, onCheckedChange = onDemoMode)
         }
-
-        Spacer(Modifier.height(20.dp))
-        Text("API base URL", fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = urlDraft,
-            onValueChange = { urlDraft = it },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            supportingText = {
-                Text("Production: https://finrado.com")
-            }
-        )
-        Spacer(Modifier.height(8.dp))
-        Button(onClick = { onSaveBaseUrl(urlDraft) }) { Text("Save API URL") }
 
         Spacer(Modifier.height(24.dp))
         Text("Personalized baseline", fontWeight = FontWeight.Bold)

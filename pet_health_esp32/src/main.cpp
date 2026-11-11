@@ -41,10 +41,14 @@ float currentHrv = 0;
 float signalQuality = 0;
 bool artifactRejected = false;
 
-float lastAccelEnergy = 9.8f;
+float lastDynamicEnergy = 0.0f;
+float dynamicEma = 0.0f;
 String currentActivity = "unknown";
 float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
 float accelEnergy = 0, gyroEnergy = 0, jerk = 0, enclosureTempC = 0;
+unsigned long dayAnchorMs = 0;
+unsigned long lastMoveIncMs = 0;
+const float GRAVITY_MS2 = 9.81f;
 
 void pushIbi(unsigned long ibi) {
   if (ibi < 300 || ibi > 1500) return;
@@ -60,21 +64,27 @@ void recomputeVitals() {
     signalQuality = constrain(signalQuality * 0.9f, 0.0f, 0.4f);
     return;
   }
+  // Walk circular buffer in chronological order (oldest → newest)
+  unsigned long ordered[IBI_BUFFER];
+  int start = (ibiIndex - ibiCount + IBI_BUFFER) % IBI_BUFFER;
+  for (int i = 0; i < ibiCount; i++) {
+    ordered[i] = ibiMs[(start + i) % IBI_BUFFER];
+  }
   float sum = 0;
-  for (int i = 0; i < ibiCount; i++) sum += ibiMs[i];
+  for (int i = 0; i < ibiCount; i++) sum += ordered[i];
   float meanIbi = sum / ibiCount;
   currentBpm = (int)constrain(60000.0f / meanIbi, 40, 200);
   float sq = 0;
   int pairs = 0;
   for (int i = 1; i < ibiCount; i++) {
-    long d = (long)ibiMs[i] - (long)ibiMs[i - 1];
+    long d = (long)ordered[i] - (long)ordered[i - 1];
     sq += d * d;
     pairs++;
   }
   currentHrv = pairs > 0 ? sqrt(sq / pairs) : 0;
   float var = 0;
   for (int i = 0; i < ibiCount; i++) {
-    float d = ibiMs[i] - meanIbi;
+    float d = ordered[i] - meanIbi;
     var += d * d;
   }
   var /= ibiCount;
@@ -89,11 +99,22 @@ void samplePulse(bool motionBusy) {
   ema = EMA_ALPHA * raw + (1.0f - EMA_ALPHA) * ema;
   float threshold = ema + 40.0f;
   unsigned long now = millis();
+
+  // Always expire stale BPM (even during motion) so UI never sticks on old HR.
+  if (lastPeakMs > 0 && now - lastPeakMs > 3000) {
+    currentBpm = 0;
+    currentHrv = 0;
+    signalQuality = max(0.05f, signalQuality * 0.8f);
+    artifactRejected = true;
+  }
+
   if (motionBusy) {
     artifactRejected = true;
     signalQuality = min(signalQuality, 0.25f);
+    rising = false;
     return;
   }
+
   if (raw > threshold && !rising) {
     rising = true;
     if (lastPeakMs > 0 && (now - lastPeakMs) >= REFRACTORY_MS) {
@@ -105,20 +126,20 @@ void samplePulse(bool motionBusy) {
   } else if (raw < ema) {
     rising = false;
   }
-  if (now - lastPeakMs > 3000) {
-    currentBpm = 0;
-    currentHrv = 0;
-    signalQuality = max(0.05f, signalQuality * 0.8f);
-    artifactRejected = true;
-  }
 }
 
-String classifyActivity(float axV, float ayV, float azV, float energy) {
-  if (ayV > 9.5) return "standing";
-  if (energy > 12) return "playing";
-  if (axV > 5 || energy > 4) return "walking";
-  if (azV > 8) return "laying";
-  if (energy < 1.5) return "sleeping";
+// dynamicEnergy = |‖a‖ − g| (m/s²). Gravity-inclusive ‖a‖ must NOT drive class labels.
+String classifyActivity(float axV, float ayV, float azV, float dynamicEnergy, float gyroE) {
+  if (dynamicEnergy > 6.0f || gyroE > 3.0f) return "playing";
+  if (dynamicEnergy > 1.8f || gyroE > 1.2f) return "walking";
+
+  float abx = fabs(axV), aby = fabs(ayV), abz = fabs(azV);
+  if (aby >= abx && aby >= abz && aby > 7.0f) return "standing";
+  if (abz >= abx && abz >= aby && abz > 7.0f) {
+    if (dynamicEnergy < 0.35f && gyroE < 0.45f) return "sleeping";
+    return "laying";
+  }
+  if (dynamicEnergy < 0.35f && gyroE < 0.4f) return "sleeping";
   return "unknown";
 }
 
@@ -310,6 +331,14 @@ void loop() {
   bleProvisionLoop();
   applyBleCredsIfNeeded();
 
+  // Soft "calendar day": reset session counters every 24h of uptime
+  if (dayAnchorMs == 0) dayAnchorMs = now;
+  if (now - dayAnchorMs >= 86400000UL) {
+    standingTime = sleepingTime = layingTime = activeTime = 0;
+    movementCount = 0;
+    dayAnchorMs = now;
+  }
+
   if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
     lastSampleTime = now;
     sensors_event_t a, g, temp;
@@ -321,13 +350,26 @@ void loop() {
     gy = g.gyro.y;
     gz = g.gyro.z;
     enclosureTempC = temp.temperature;
-    accelEnergy = sqrt(ax * ax + ay * ay + az * az);
+
+    float mag = sqrt(ax * ax + ay * ay + az * az);
+    float dynamic = fabs(mag - GRAVITY_MS2);
+    dynamicEma = 0.25f * dynamic + 0.75f * dynamicEma;
+    // Publish motion energy (not gravity-inclusive ‖a‖) so activity/HR correlate.
+    accelEnergy = dynamicEma;
     gyroEnergy = sqrt(gx * gx + gy * gy + gz * gz);
-    jerk = fabs(accelEnergy - lastAccelEnergy) / (SAMPLE_INTERVAL_MS / 1000.0f);
-    lastAccelEnergy = accelEnergy;
-    currentActivity = classifyActivity(ax, ay, az, accelEnergy);
-    bool motionBusy = (currentActivity == "walking" || currentActivity == "playing" || jerk > 15);
-    if (currentActivity == "walking" || currentActivity == "playing") movementCount++;
+    jerk = fabs(dynamicEma - lastDynamicEnergy) / (SAMPLE_INTERVAL_MS / 1000.0f);
+    lastDynamicEnergy = dynamicEma;
+
+    currentActivity = classifyActivity(ax, ay, az, dynamicEma, gyroEnergy);
+    bool motionBusy =
+        (currentActivity == "walking" || currentActivity == "playing" || jerk > 15.0f);
+
+    // ~1 Hz step proxy while moving (not every 20ms sample)
+    if (motionBusy && now - lastMoveIncMs >= 1000) {
+      movementCount++;
+      lastMoveIncMs = now;
+    }
+
     if (currentActivity != lastState) {
       unsigned long spent = (now - lastStateChangeTime) / 1000;
       if (lastState == "standing") standingTime += spent;

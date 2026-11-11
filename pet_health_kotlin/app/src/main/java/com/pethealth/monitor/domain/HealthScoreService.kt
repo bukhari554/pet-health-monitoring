@@ -1,41 +1,52 @@
 package com.pethealth.monitor.domain
 
 import com.pethealth.monitor.data.HealthScore
+import com.pethealth.monitor.data.PetBaseline
 import com.pethealth.monitor.data.SensorReading
 
 class HealthScoreService {
-    fun compute(r: SensorReading, openAlerts: Int): HealthScore {
+    fun compute(
+        r: SensorReading,
+        openAlerts: Int,
+        baseline: PetBaseline? = null
+    ): HealthScore {
         var score = 100
         val reasons = mutableListOf<String>()
+        val highResting = baseline?.highRestingHrThreshold ?: 130
+        val lowHrv = baseline?.lowHrvThreshold ?: 18
+        val lowHr = 55
+        val overExertion = 170
+        val tracked =
+            r.sleepingMinutes + r.activeMinutes + r.layingMinutes + r.standingMinutes
 
         if (r.artifactRejected || r.signalQuality < 0.35f) {
             score -= 8
             reasons += "Pulse signal quality is low"
         }
 
-        if (!r.artifactRejected && r.signalQuality >= 0.4f) {
+        if (!r.artifactRejected && r.signalQuality >= 0.4f && r.heartRateBpm > 0) {
             when {
-                r.isResting && r.heartRateBpm >= 130 -> {
+                r.isResting && r.heartRateBpm >= highResting -> {
                     score -= 25
-                    reasons += "High resting heart rate (${r.heartRateBpm} bpm)"
+                    reasons += "High resting heart rate (${r.heartRateBpm} bpm, thr $highResting)"
                 }
-                r.heartRateBpm >= 170 -> {
+                r.heartRateBpm >= overExertion -> {
                     score -= 12
                     reasons += "Very high exertion HR (${r.heartRateBpm} bpm)"
                 }
-                r.heartRateBpm in 1..54 -> {
+                r.heartRateBpm < lowHr -> {
                     score -= 30
                     reasons += "Low heart rate (${r.heartRateBpm} bpm)"
                 }
             }
 
-            if (r.isResting && r.hrvRmssdMs > 0f && r.hrvRmssdMs < 18f) {
+            if (r.isResting && r.hrvRmssdMs > 0f && r.hrvRmssdMs < lowHrv.toFloat()) {
                 score -= 10
-                reasons += "Low resting HRV"
+                reasons += "Low resting HRV (thr $lowHrv ms)"
             }
         }
 
-        if (r.sleepingMinutes < 360) {
+        if (tracked >= 180 && r.sleepingMinutes < 360) {
             score -= 8
             reasons += "Sleep so far looks short (${r.sleepingMinutes} min tracked)"
         }

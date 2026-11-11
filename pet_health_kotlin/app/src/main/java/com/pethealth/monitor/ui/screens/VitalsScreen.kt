@@ -86,10 +86,10 @@ fun VitalsScreen(latest: SensorReading?, history: List<SensorReading>) {
         BpmChart(history.map { it.heartRateBpm })
 
         Spacer(Modifier.height(20.dp))
-        SectionHeader("IMU (MPU6050)", "Accel / gyro / enclosure temp")
+        SectionHeader("IMU (MPU6050)", "Accel m/s² · motion = |‖a‖−g|")
         MetricRow {
-            MetricTile("Accel energy", "%.1f".format(latest.accelEnergy), "g-energy", modifier = Modifier.weight(1f))
-            MetricTile("Gyro energy", "%.1f".format(latest.gyroEnergy), "rad-energy", accent = Sky, modifier = Modifier.weight(1f))
+            MetricTile("Motion", "%.2f".format(latest.accelEnergy), "m/s² dyn", modifier = Modifier.weight(1f))
+            MetricTile("Gyro energy", "%.2f".format(latest.gyroEnergy), "rad/s", accent = Sky, modifier = Modifier.weight(1f))
         }
         Spacer(Modifier.height(10.dp))
         MetricRow {
@@ -98,9 +98,9 @@ fun VitalsScreen(latest: SensorReading?, history: List<SensorReading>) {
         }
         Spacer(Modifier.height(10.dp))
         MetricRow {
-            MetricTile("X", "%.2f".format(latest.accelX), "g", modifier = Modifier.weight(1f))
-            MetricTile("Y", "%.2f".format(latest.accelY), "g", modifier = Modifier.weight(1f))
-            MetricTile("Z", "%.2f".format(latest.accelZ), "g", modifier = Modifier.weight(1f))
+            MetricTile("X", "%.2f".format(latest.accelX), "m/s²", modifier = Modifier.weight(1f))
+            MetricTile("Y", "%.2f".format(latest.accelY), "m/s²", modifier = Modifier.weight(1f))
+            MetricTile("Z", "%.2f".format(latest.accelZ), "m/s²", modifier = Modifier.weight(1f))
         }
     }
 }

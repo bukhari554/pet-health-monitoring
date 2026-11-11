@@ -115,11 +115,21 @@ class HostCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
     String v = c->getValue().c_str();
     v.trim();
-    if (v.length() == 0 || v.length() > 64) return;
+    if (v.length() == 0 || v.length() > 160) return;
+
+    // Optional packed form from app: "mqttHost[:port];https://api.example"
+    String apiPart;
+    int semi = v.indexOf(';');
+    if (semi > 0) {
+      apiPart = v.substring(semi + 1);
+      apiPart.trim();
+      v = v.substring(0, semi);
+      v.trim();
+    }
+
     // Accept "192.168.1.14" or "192.168.1.14:1883" or full http URL
     if (v.startsWith("http://") || v.startsWith("https://")) {
       gApiBase = v;
-      // extract host for MQTT if possible
       int start = v.indexOf("://") + 3;
       int slash = v.indexOf('/', start);
       String hostPort = slash > 0 ? v.substring(start, slash) : v.substring(start);
@@ -134,7 +144,13 @@ class HostCallbacks : public BLECharacteristicCallbacks {
       } else {
         gHost = v;
       }
-      gApiBase = String("http://") + gHost + ":3000";
+      if (apiPart.startsWith("http://") || apiPart.startsWith("https://")) {
+        gApiBase = apiPart;
+      } else if (gHost == "31.97.187.83") {
+        gApiBase = "https://finrado.com";
+      } else if (!gApiBase.startsWith("https://")) {
+        gApiBase = String("http://") + gHost + ":3000";
+      }
     }
     Serial.printf("BLE HOST=%s port=%u api=%s\n", gHost.c_str(), gPort, gApiBase.c_str());
   }

@@ -185,10 +185,11 @@ fun DashboardScreen(
                     modifier = Modifier.weight(1f)
                 )
             }
-            if (latest.isResting && latest.heartRateBpm >= 130) {
+            val highRestingThr = baseline?.highRestingHrThreshold ?: 130
+            if (latest.isResting && latest.heartRateBpm >= highRestingThr) {
                 Spacer(Modifier.height(10.dp))
                 Text(
-                    "Context: high HR while resting — fusion alert expected",
+                    "Context: high HR while resting (thr $highRestingThr) — fusion alert expected",
                     fontSize = 12.sp,
                     color = Coral
                 )
