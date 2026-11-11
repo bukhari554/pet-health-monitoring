@@ -1,0 +1,39 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pet
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-PetH3alth_Pg_2026Live}
+      POSTGRES_DB: pet_health
+    volumes:
+      - pet_health_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pet -d pet_health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # Internal only — API reaches db via service name
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: "3000"
+      DATABASE_URL: postgres://pet:${POSTGRES_PASSWORD:-PetH3alth_Pg_2026Live}@db:5432/pet_health
+      CORS_ORIGIN: "*"
+      DEVICE_INGEST_TOKEN: ${DEVICE_INGEST_TOKEN:-dev-device-token}
+      DEVICE_SERIAL: ${DEVICE_SERIAL:-PET-0001}
+      MQTT_PORT: "1883"
+      MQTT_WS_PORT: "9001"
+    ports:
+      # Host 3000 is Dokploy UI — use 3001 for HTTP API until domain is attached
+      - "3001:3000"
+      - "1883:1883"
+      - "9001:9001"
+
+volumes:
+  pet_health_pg:

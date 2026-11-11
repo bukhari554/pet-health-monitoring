@@ -1,0 +1,36 @@
+{
+  "name": "pet-health-api",
+  "version": "1.0.0",
+  "description": "Pet Health Monitoring API — Fastify + PostgreSQL",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "db:migrate:baselines": "tsx src/db/migrateBaselines.ts",
+    "db:migrate:devices": "tsx src/db/migrateDevices.ts",
+    "db:seed": "tsx src/db/seed.ts",
+    "simulate:device": "tsx src/scripts/simulateDevice.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.1",
+    "@fastify/sensible": "^6.0.1",
+    "aedes": "^1.2.0",
+    "dotenv": "^16.4.5",
+    "fastify": "^5.1.0",
+    "mqtt": "^5.16.1",
+    "pg": "^8.13.1",
+    "websocket-stream": "^5.5.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
