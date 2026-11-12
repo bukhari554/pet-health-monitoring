@@ -11,7 +11,7 @@ import {
 
 const ingestSchema = z.object({
   petId: z.string().uuid(),
-  recordedAt: z.string().datetime().optional(),
+  recordedAt: z.string().min(1).optional(),
   accelX: z.number(),
   accelY: z.number(),
   accelZ: z.number(),

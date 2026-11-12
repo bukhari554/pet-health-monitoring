@@ -1,15 +1,69 @@
-**/node_modules/
-**/dist/
-**/.pio/
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+*.iml
+.cursor/
+agent-transcripts/
+
+# Secrets / local machine
+.env
+.env.*
+!.env.example
+local.properties
+**/credentials.json
+**/google-services.json
+*.keystore
+*.jks
+
+# Android / Gradle
 **/.gradle/
 **/build/
-**/.idea/
-**/*.iml
-**/.env
-**/.env.local
-**/PetHealthMonitor-debug.apk
-**/*.apk
-**/.DS_Store
-**/local.properties
-**/.cxx/
 **/captures/
+**/.externalNativeBuild/
+**/.cxx/
+**/out/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Kotlin / Java
+**/.kotlin/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# PlatformIO / ESP32
+**/.pio/
+pet_health_esp32/.pio/
+**/compile_commands.json
+
+# Node / API
+**/node_modules/
+**/dist/
+**/coverage/
+**/.next/
+**/.turbo/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/.venv/
+**/venv/
+
+# Logs / temp
+*.log
+tmp/
+temp/
+_tmp_*
+_dark_redesign*
+*.tmp
+
+# Misc recover scripts
+_recover_from_transcript.py

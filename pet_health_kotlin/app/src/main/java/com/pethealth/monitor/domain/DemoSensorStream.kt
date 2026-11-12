@@ -23,6 +23,9 @@ class DemoSensorStream(private val petId: String) {
         }
     }
 
+    /** One live sample — used when cloud vitals are stale / offline. */
+    fun sample(): SensorReading = next()
+
     private fun next(): SensorReading {
         tick++
         val phase = tick % 40

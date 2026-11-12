@@ -12,8 +12,8 @@ android {
         applicationId = "com.pethealth.monitor"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "2.3.0"
+        versionCode = 21
+        versionName = "2.8.2"
     }
 
     buildTypes {

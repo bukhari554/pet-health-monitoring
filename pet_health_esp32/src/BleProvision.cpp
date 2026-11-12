@@ -2,25 +2,25 @@
 
 #include <BLE2902.h>
 #include <BLEDevice.h>
+#include <BLESecurity.h>
 #include <BLEServer.h>
-#include <BLEUtils.h>
 #include <Preferences.h>
-#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <algorithm>
+#include <cstring>
+#include <vector>
 #include <config.h>
 
-// PetHealth BLE provisioning service (GlucoTouch-style local link)
-static const char *SVC_UUID = "7a5f0001-4d3e-4b2a-9c1d-8e7f6a5b4c3d";
-static const char *SSID_UUID = "7a5f0002-4d3e-4b2a-9c1d-8e7f6a5b4c3d";
-static const char *PASS_UUID = "7a5f0003-4d3e-4b2a-9c1d-8e7f6a5b4c3d";
-static const char *HOST_UUID = "7a5f0004-4d3e-4b2a-9c1d-8e7f6a5b4c3d";
-static const char *APPLY_UUID = "7a5f0005-4d3e-4b2a-9c1d-8e7f6a5b4c3d";
-static const char *STATUS_UUID = "7a5f0006-4d3e-4b2a-9c1d-8e7f6a5b4c3d";
-static const char *INFO_UUID = "7a5f0007-4d3e-4b2a-9c1d-8e7f6a5b4c3d";
+// GlucoAgri BLE UUIDs — keep protocol identical so Android BleProvision works as-is.
+static const char *SERVICE_UUID = "4f9a0001-7c2e-4b1a-9d33-51a6c8e04b10";
+static const char *CMD_UUID = "4f9a0002-7c2e-4b1a-9d33-51a6c8e04b10";
+static const char *STATUS_UUID = "4f9a0003-7c2e-4b1a-9d33-51a6c8e04b10";
+static const char *SCAN_UUID = "4f9a0004-7c2e-4b1a-9d33-51a6c8e04b10";
 
 static Preferences prefs;
-static BLEServer *server = nullptr;
 static BLECharacteristic *statusChar = nullptr;
-static BLECharacteristic *infoChar = nullptr;
+static BLECharacteristic *scanChar = nullptr;
+static bool clientOn = false;
 
 static String gSerial = DEVICE_SERIAL;
 static String gSsid = WIFI_SSID;
@@ -30,11 +30,19 @@ static uint16_t gPort = MQTT_PORT;
 static String gApiBase = API_BASE;
 
 static bool credsDirty = false;
-static bool deviceConnected = false;
+static bool scanning = false;
+static bool expectLink = false;
+static bool wifiPaused = false;
+static uint32_t lastScan = 0;
+static uint32_t connectAt = 0;
 static bool wifiState = false;
 static bool mqttState = false;
 static int rssiState = 0;
-static unsigned long lastStatusPushMs = 0;
+
+static char qSsid[33];
+static char qPass[65];
+static volatile uint8_t qScan = 0;
+static volatile uint8_t qCred = 0;
 
 static void persistCreds() {
   prefs.putString("ssid", gSsid);
@@ -53,189 +61,209 @@ static void loadCreds() {
   gApiBase = prefs.getString("api", API_BASE);
 }
 
-static String statusJson() {
-  StaticJsonDocument<256> doc;
-  doc["serial"] = gSerial;
-  doc["ble"] = deviceConnected;
-  doc["wifi"] = wifiState;
-  doc["mqtt"] = mqttState;
-  doc["cloud"] = wifiState && mqttState;
-  doc["rssi"] = rssiState;
-  doc["ssid"] = gSsid;
-  doc["host"] = gHost;
-  doc["port"] = gPort;
-  String out;
-  serializeJson(doc, out);
-  return out;
-}
+class ProvSecurity : public BLESecurityCallbacks {
+  uint32_t onPassKeyRequest() override { return 0; }
+  void onPassKeyNotify(uint32_t) override {}
+  bool onConfirmPIN(uint32_t) override { return true; }
+  bool onSecurityRequest() override { return false; }
+  void onAuthenticationComplete(esp_ble_auth_cmpl_t) override {}
+};
 
-static void pushStatus(bool force = false) {
-  if (!statusChar) return;
-  unsigned long now = millis();
-  if (!force && now - lastStatusPushMs < 1000) return;
-  lastStatusPushMs = now;
-  String payload = statusJson();
-  statusChar->setValue(payload.c_str());
-  if (deviceConnected) statusChar->notify();
-}
-
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *s) override {
-    deviceConnected = true;
-    Serial.println("BLE: phone connected");
-    pushStatus(true);
+class ProvServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *) override {
+    clientOn = true;
+    qScan = 1;  // auto WiFi scan on phone connect (Gluco behavior)
+    Serial.println("BLE: phone connected — WiFi scan queued");
   }
-  void onDisconnect(BLEServer *s) override {
-    deviceConnected = false;
+  void onDisconnect(BLEServer *) override {
+    clientOn = false;
     Serial.println("BLE: phone disconnected — advertising");
-    s->startAdvertising();
+    BLEDevice::startAdvertising();
   }
 };
 
-class SsidCallbacks : public BLECharacteristicCallbacks {
+class ProvCmdCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
-    String v = c->getValue().c_str();
-    v.trim();
-    if (v.length() == 0 || v.length() > 32) return;
-    gSsid = v;
-    Serial.printf("BLE SSID=%s\n", gSsid.c_str());
-  }
-};
-
-class PassCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *c) override {
-    String v = c->getValue().c_str();
-    if (v.length() > 63) return;
-    gPass = v;
-    Serial.println("BLE PASS received");
-  }
-};
-
-class HostCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *c) override {
-    String v = c->getValue().c_str();
-    v.trim();
-    if (v.length() == 0 || v.length() > 160) return;
-
-    // Optional packed form from app: "mqttHost[:port];https://api.example"
-    String apiPart;
-    int semi = v.indexOf(';');
-    if (semi > 0) {
-      apiPart = v.substring(semi + 1);
-      apiPart.trim();
-      v = v.substring(0, semi);
-      v.trim();
+    std::string v = c->getValue();
+    if (v.empty()) return;
+    if ((uint8_t)v[0] == 1) {
+      qScan = 1;
+      return;
     }
+    if ((uint8_t)v[0] == 2 && v.size() >= 3) {
+      uint8_t sl = (uint8_t)v[1];
+      if (sl > 32 || (size_t)(2 + sl) >= v.size()) return;
+      uint8_t pl = (uint8_t)v[2 + sl];
+      if (pl > 64 || v.size() < (size_t)(3 + sl + pl)) return;
+      memset(qSsid, 0, sizeof(qSsid));
+      memset(qPass, 0, sizeof(qPass));
+      memcpy(qSsid, v.data() + 2, sl);
+      memcpy(qPass, v.data() + 3 + sl, pl);
+      qCred = 1;
+      return;
+    }
+    // cmd 3 (mode/profile) ignored for Pet Health collar
+  }
+};
 
-    // Accept "192.168.1.14" or "192.168.1.14:1883" or full http URL
-    if (v.startsWith("http://") || v.startsWith("https://")) {
-      gApiBase = v;
-      int start = v.indexOf("://") + 3;
-      int slash = v.indexOf('/', start);
-      String hostPort = slash > 0 ? v.substring(start, slash) : v.substring(start);
-      int colon = hostPort.indexOf(':');
-      gHost = colon > 0 ? hostPort.substring(0, colon) : hostPort;
-    } else {
-      int colon = v.indexOf(':');
-      if (colon > 0) {
-        gHost = v.substring(0, colon);
-        gPort = (uint16_t)v.substring(colon + 1).toInt();
-        if (gPort == 0) gPort = MQTT_PORT;
-      } else {
-        gHost = v;
-      }
-      if (apiPart.startsWith("http://") || apiPart.startsWith("https://")) {
-        gApiBase = apiPart;
-      } else if (gHost == "31.97.187.83") {
-        gApiBase = "https://finrado.com";
-      } else if (!gApiBase.startsWith("https://")) {
-        gApiBase = String("http://") + gHost + ":3000";
+static void notifyStatus(const char *text) {
+  if (!statusChar || !clientOn) return;
+  statusChar->setValue((uint8_t *)text, strlen(text));
+  statusChar->notify();
+}
+
+static void notifyHit(const char *ssid, int8_t rssi, bool secure) {
+  if (!scanChar || !clientOn) return;
+  uint8_t buf[36];
+  size_t n = strlen(ssid);
+  if (n > 32) n = 32;
+  buf[0] = 0x11;
+  buf[1] = (uint8_t)rssi;
+  buf[2] = secure ? 1 : 0;
+  memcpy(buf + 3, ssid, n);
+  scanChar->setValue(buf, 3 + n);
+  scanChar->notify();
+  delay(25);
+}
+
+static void notifyEnd() {
+  if (!scanChar || !clientOn) return;
+  uint8_t end = 0x10;
+  scanChar->setValue(&end, 1);
+  scanChar->notify();
+}
+
+static void startScan() {
+  if (scanning) return;
+  scanning = true;
+  wifiPaused = true;
+  WiFi.scanDelete();
+  WiFi.scanNetworks(true);
+  notifyStatus("scanning");
+  Serial.println("BLE: WiFi scan started");
+}
+
+static void finishScan(int count) {
+  scanning = false;
+  wifiPaused = false;
+  if (count < 0) count = 0;
+  struct Hit {
+    String ssid;
+    int8_t rssi;
+    bool secure;
+  };
+  std::vector<Hit> best;
+  for (int i = 0; i < count; i++) {
+    String ssid = WiFi.SSID(i);
+    if (!ssid.length()) continue;
+    int8_t rssi = (int8_t)WiFi.RSSI(i);
+    bool secure = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+    bool found = false;
+    for (auto &h : best) {
+      if (h.ssid == ssid) {
+        if (rssi > h.rssi) h.rssi = rssi;
+        found = true;
+        break;
       }
     }
-    Serial.printf("BLE HOST=%s port=%u api=%s\n", gHost.c_str(), gPort, gApiBase.c_str());
+    if (!found) best.push_back({ssid, rssi, secure});
   }
-};
-
-class ApplyCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *c) override {
-    String v = c->getValue().c_str();
-    v.trim();
-    if (v.length() == 0) return;
-    persistCreds();
-    credsDirty = true;
-    Serial.println("BLE APPLY — reconnect WiFi/MQTT");
-    pushStatus(true);
-  }
-};
+  std::sort(best.begin(), best.end(), [](const Hit &a, const Hit &b) { return a.rssi > b.rssi; });
+  if (best.size() > 12) best.resize(12);
+  WiFi.scanDelete();
+  for (auto &h : best) notifyHit(h.ssid.c_str(), h.rssi, h.secure);
+  notifyEnd();
+  notifyStatus("idle");
+  lastScan = millis();
+  Serial.printf("BLE: WiFi scan done (%d nets)\n", (int)best.size());
+}
 
 void bleProvisionBegin(const char *serial) {
   gSerial = serial;
   loadCreds();
 
-  String name = String("PetHealth-") + gSerial;
-  BLEDevice::init(name.c_str());
-  server = BLEDevice::createServer();
-  server->setCallbacks(new ServerCallbacks());
-
-  BLEService *svc = server->createService(SVC_UUID);
-
-  BLECharacteristic *ssidChar = svc->createCharacteristic(
-      SSID_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
-  ssidChar->setCallbacks(new SsidCallbacks());
-  ssidChar->setValue(gSsid.c_str());
-
-  BLECharacteristic *passChar = svc->createCharacteristic(
-      PASS_UUID, BLECharacteristic::PROPERTY_WRITE);
-  passChar->setCallbacks(new PassCallbacks());
-
-  BLECharacteristic *hostChar = svc->createCharacteristic(
-      HOST_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
-  hostChar->setCallbacks(new HostCallbacks());
-  hostChar->setValue(gHost.c_str());
-
-  BLECharacteristic *applyChar = svc->createCharacteristic(
-      APPLY_UUID, BLECharacteristic::PROPERTY_WRITE);
-  applyChar->setCallbacks(new ApplyCallbacks());
-
-  statusChar = svc->createCharacteristic(
-      STATUS_UUID,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  // Short fixed name (Gluco style) — longer names get truncated / dropped from ads.
+  BLEDevice::init("PetHealth");
+  BLEDevice::setPower(ESP_PWR_LVL_P9);
+  BLEDevice::setMTU(185);
+  BLEDevice::setSecurityCallbacks(new ProvSecurity());
+  BLEServer *server = BLEDevice::createServer();
+  server->setCallbacks(new ProvServerCallbacks());
+  BLEService *service = server->createService(SERVICE_UUID);
+  BLECharacteristic *cmd = service->createCharacteristic(CMD_UUID, BLECharacteristic::PROPERTY_WRITE);
+  cmd->setCallbacks(new ProvCmdCallbacks());
+  statusChar = service->createCharacteristic(
+      STATUS_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
   statusChar->addDescriptor(new BLE2902());
-  statusChar->setValue(statusJson().c_str());
+  scanChar = service->createCharacteristic(
+      SCAN_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  scanChar->addDescriptor(new BLE2902());
+  service->start();
 
-  infoChar = svc->createCharacteristic(INFO_UUID, BLECharacteristic::PROPERTY_READ);
-  StaticJsonDocument<192> info;
-  info["serial"] = gSerial;
-  info["fw"] = "pet-health-esp32";
-  info["svc"] = "ble-provision";
-  String infoStr;
-  serializeJson(info, infoStr);
-  infoChar->setValue(infoStr.c_str());
-
-  svc->start();
-
-  BLEAdvertising *adv = BLEDevice::getAdvertising();
-  adv->addServiceUUID(SVC_UUID);
-  adv->setScanResponse(true);
-  adv->setMinPreferred(0x06);
-  BLEDevice::startAdvertising();
-  Serial.printf("BLE advertising as %s\n", name.c_str());
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->start();
+  lastScan = millis();
+  Serial.printf("BLE advertising as PetHealth serial=%s (Gluco protocol)\n", gSerial.c_str());
 }
 
 void bleProvisionLoop() {
-  pushStatus(false);
+  if (qCred) {
+    char ssid[33];
+    char pass[65];
+    memcpy(ssid, qSsid, sizeof(ssid));
+    memcpy(pass, qPass, sizeof(pass));
+    qCred = 0;
+    if (ssid[0]) {
+      gSsid = ssid;
+      gPass = pass;
+      persistCreds();
+      credsDirty = true;
+      expectLink = true;
+      connectAt = millis();
+      notifyStatus("saved");
+      Serial.printf("BLE: WiFi saved SSID=%s — connecting\n", ssid);
+    }
+  }
+  if (qScan) {
+    qScan = 0;
+    startScan();
+  }
+  if (scanning) {
+    int n = WiFi.scanComplete();
+    if (n >= 0 || n == WIFI_SCAN_FAILED) finishScan(n);
+  } else if (!wifiState && clientOn && millis() - lastScan > 20000) {
+    startScan();
+  }
+  if (expectLink && wifiState) {
+    expectLink = false;
+    notifyStatus("connected");
+    Serial.println("BLE: WiFi connected status → phone");
+  } else if (expectLink && millis() - connectAt > 15000) {
+    expectLink = false;
+    notifyStatus("failed");
+    Serial.println("BLE: WiFi connect timeout");
+  }
+
+  static unsigned long lastAdvKickMs = 0;
+  unsigned long now = millis();
+  if (!clientOn && now - lastAdvKickMs > 12000) {
+    lastAdvKickMs = now;
+    BLEDevice::startAdvertising();
+  }
 }
 
 void bleProvisionSetLinkState(bool wifiUp, bool mqttUp, int wifiRssi) {
-  bool changed = (wifiState != wifiUp) || (mqttState != mqttUp) || (rssiState != wifiRssi);
   wifiState = wifiUp;
   mqttState = mqttUp;
   rssiState = wifiRssi;
-  if (changed) pushStatus(true);
 }
 
 bool bleCredsDirty() { return credsDirty; }
 void bleCredsAck() { credsDirty = false; }
+bool bleWifiPaused() { return wifiPaused || scanning; }
+bool blePhoneLinked() { return clientOn; }
 
 String bleWifiSsid() { return gSsid; }
 String bleWifiPass() { return gPass; }

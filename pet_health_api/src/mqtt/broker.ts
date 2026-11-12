@@ -1,59 +1,106 @@
 import { createServer } from 'net';
 import { createServer as createHttpServer } from 'http';
-import { Aedes, type Client } from 'aedes';
-// websocket-stream has incomplete typings for createServer
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore
+// aedes is CJS — Node ESM only gets default export (same fn as createBroker).
+// Package .d.ts lists named createBroker, which does not exist at runtime under NodeNext.
+import aedesDefault from 'aedes';
+import type { AuthenticateError, Client, AedesPublishPacket } from 'aedes';
+import type { Duplex } from 'node:stream';
 import websocketStream from 'websocket-stream';
+
+type AedesInstance = {
+  handle: (stream: Duplex, request?: unknown) => Client;
+  on(
+    event: 'clientReady' | 'clientDisconnect',
+    listener: (client: Client) => void | Promise<void>,
+  ): void;
+  on(
+    event: 'publish',
+    listener: (packet: AedesPublishPacket, client: Client | null) => void | Promise<void>,
+  ): void;
+};
+
+type AedesFactory = (options?: {
+  authenticate?: (
+    client: Client,
+    username: Readonly<string | undefined>,
+    password: Readonly<Buffer | undefined>,
+    done: (error: AuthenticateError | null, success: boolean | null) => void,
+  ) => void;
+}) => AedesInstance;
+
+const aedes = aedesDefault as unknown as AedesFactory;
 import { authenticateDevice, setMqttDown, touchDevice } from '../services/deviceService.js';
 import { ingestReading } from '../services/sensorService.js';
 import { config } from '../config.js';
+import type { ActivityClass } from '../types.js';
+
+type ClientWithSerial = Client & { petSerial?: string };
+
+function asActivity(raw: unknown): ActivityClass | undefined {
+  const v = String(raw ?? '');
+  switch (v) {
+    case 'sleeping':
+    case 'laying':
+    case 'standing':
+    case 'walking':
+    case 'playing':
+    case 'unknown':
+      return v;
+    default:
+      return undefined;
+  }
+}
 
 export async function startMqttBroker(log: {
   info: (o: unknown, msg?: string) => void;
   error: (o: unknown, msg?: string) => void;
 }) {
-  const broker = await Aedes.createBroker({
+  const broker = aedes({
     authenticate(client, username, password, done) {
       const serial = String(username ?? '');
       const token = password ? password.toString() : '';
       authenticateDevice(serial, token)
         .then((device) => {
           if (!device) {
-            const err = Object.assign(new Error('Auth failed'), { returnCode: 4 });
+            const err = Object.assign(new Error('Auth failed'), {
+              returnCode: 4,
+            }) as AuthenticateError;
             done(err, false);
             return;
           }
-          (client as Client & { petSerial?: string }).petSerial = serial;
+          (client as ClientWithSerial).petSerial = serial;
           done(null, true);
         })
-        .catch((err) => done(err, false));
+        .catch((err: Error) => {
+          const authErr = Object.assign(err, { returnCode: 4 }) as AuthenticateError;
+          done(authErr, false);
+        });
     },
   });
 
-  broker.on('clientReady', async (client) => {
-    const serial = (client as Client & { petSerial?: string }).petSerial;
+  broker.on('clientReady', async (client: Client) => {
+    const serial = (client as ClientWithSerial).petSerial;
     if (!serial) return;
     await touchDevice(serial, { mqttUp: true });
     log.info({ serial, id: client.id }, 'MQTT client ready');
   });
 
-  broker.on('clientDisconnect', async (client) => {
-    const serial = (client as Client & { petSerial?: string }).petSerial;
+  broker.on('clientDisconnect', async (client: Client) => {
+    const serial = (client as ClientWithSerial).petSerial;
     if (!serial) return;
     await setMqttDown(serial);
     log.info({ serial, id: client.id }, 'MQTT client disconnected');
   });
 
-  broker.on('publish', async (packet, client) => {
+  broker.on('publish', async (packet: AedesPublishPacket, client: Client | null) => {
     if (!client) return;
     const topic = packet.topic;
-    const serial = (client as Client & { petSerial?: string }).petSerial;
+    const serial = (client as ClientWithSerial).petSerial;
     if (!serial) return;
 
     let payload: Record<string, unknown> = {};
     try {
-      payload = JSON.parse(packet.payload.toString());
+      payload = JSON.parse(packet.payload.toString()) as Record<string, unknown>;
     } catch {
       return;
     }
@@ -93,14 +140,7 @@ export async function startMqttBroker(log: {
           restingHeartRate:
             payload.restingHeartRate == null ? null : Number(payload.restingHeartRate),
           artifactRejected: Boolean(payload.artifactRejected ?? false),
-          activity: payload.activity as
-            | 'sleeping'
-            | 'laying'
-            | 'standing'
-            | 'walking'
-            | 'playing'
-            | 'unknown'
-            | undefined,
+          activity: asActivity(payload.activity),
           movementCount:
             payload.movementCount == null ? undefined : Number(payload.movementCount),
           layingMinutes:
@@ -124,7 +164,6 @@ export async function startMqttBroker(log: {
   });
 
   const httpServer = createHttpServer();
-  // Aedes handle is compatible at runtime; websocket-stream typings are wrong for the 2nd arg.
   const createWsServer = (
     websocketStream as unknown as {
       createServer: (opts: object, handle: typeof broker.handle) => void;

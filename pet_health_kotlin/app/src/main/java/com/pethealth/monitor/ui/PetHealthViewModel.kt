@@ -3,8 +3,7 @@ package com.pethealth.monitor.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.pethealth.monitor.ble.BleLinkState
-import com.pethealth.monitor.ble.BleProvisioner
+import com.pethealth.monitor.ble.BleProvision
 import com.pethealth.monitor.data.ApiConfig
 import com.pethealth.monitor.data.DailySummary
 import com.pethealth.monitor.data.DeviceConnectivity
@@ -14,18 +13,22 @@ import com.pethealth.monitor.data.Pet
 import com.pethealth.monitor.data.PetBaseline
 import com.pethealth.monitor.data.PetHealthApi
 import com.pethealth.monitor.data.PetHealthApi.NoReadingYetException
+import com.pethealth.monitor.data.ReadingStore
 import com.pethealth.monitor.data.SensorReading
+import com.pethealth.monitor.data.ThemePrefs
 import com.pethealth.monitor.domain.DemoSensorStream
 import com.pethealth.monitor.domain.FusionAlertEngine
 import com.pethealth.monitor.domain.HealthScoreService
 import com.pethealth.monitor.domain.JournalService
 import com.pethealth.monitor.notify.AlertNotifier
+import com.pethealth.monitor.ui.theme.ThemeMode
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -46,7 +49,12 @@ data class UiState(
     val apiOnline: Boolean = false,
     val baseUrl: String = ApiConfig.DEFAULT_BASE_URL,
     val statusMessage: String = "Connecting…",
-    val ble: BleLinkState = BleLinkState()
+    // Gluco-form BLE link
+    val bleStatus: String = "Idle",
+    val bleLinked: Boolean = false,
+    val bleWifiUp: Boolean = false,
+    val bleNetworks: List<BleProvision.WifiHit> = emptyList(),
+    val themeMode: ThemeMode = ThemeMode.SYSTEM
 ) {
     val selectedPet: Pet?
         get() = pets.firstOrNull { it.id == selectedPetId }
@@ -67,7 +75,9 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
     private val scoreService = HealthScoreService()
     private val journal = JournalService()
     private val notifier = AlertNotifier(app.applicationContext)
-    private val ble = BleProvisioner(app.applicationContext)
+    private val ble = BleProvision(app.applicationContext)
+    private val readingStore = ReadingStore(app.applicationContext)
+    private val themePrefs = ThemePrefs(app.applicationContext)
     private val notifiedIds = mutableSetOf<String>()
 
     private val _state = MutableStateFlow(
@@ -75,49 +85,84 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
             pets = listOf(
                 Pet(ApiConfig.BUDDY_ID, "Buddy", "Dog", "Labrador", 3),
                 Pet(ApiConfig.MILO_ID, "Milo", "Cat", "Persian", 2)
-            )
+            ),
+            themeMode = themePrefs.load()
         )
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
 
     private var loopJob: Job? = null
+    private var sawWifi = false
+    private var fallbackStream: DemoSensorStream? = null
+
+    companion object {
+        /** Cloud reading older than this → drive local live vitals so UI keeps moving. */
+        private const val STALE_MS = 12_000L
+    }
 
     init {
         notifier.ensureChannel()
+        val petId = _state.value.selectedPetId
+        fallbackStream = DemoSensorStream(petId)
+        val cached = readingStore.load(petId)
+        if (cached.isNotEmpty()) {
+            _state.update { it.copy(history = cached, latest = cached.lastOrNull()) }
+        }
         viewModelScope.launch {
-            ble.state.collect { link ->
-                _state.update { it.copy(ble = link) }
+            combine(ble.status, ble.linked, ble.networks, ble.wifiUp) { status, linked, nets, wifi ->
+                Quad(status, linked, nets, wifi)
+            }.collect { q ->
+                _state.update {
+                    it.copy(
+                        bleStatus = q.a,
+                        bleLinked = q.b,
+                        bleNetworks = q.c,
+                        bleWifiUp = q.d
+                    )
+                }
+                if (q.d && !sawWifi) {
+                    sawWifi = true
+                    startLiveLoop()
+                }
             }
         }
         startLiveLoop()
     }
 
-    fun bleScan() = ble.startScan()
-    fun bleStopScan() = ble.stopScan()
-    fun bleConnect(address: String) = ble.connect(address)
-    fun bleDisconnect() = ble.disconnect()
-    fun bleProvision(ssid: String, password: String) {
-        val brokerHost = _state.value.mqttUrl
-            .removePrefix("mqtt://")
-            .removePrefix("mqtts://")
-            .substringBefore(':')
-            .substringBefore('/')
-        ble.provision(ssid, password, brokerHost, _state.value.baseUrl)
+    private data class Quad<A, B, C, D>(val a: A, val b: B, val c: C, val d: D)
+
+    fun bleSearch() = ble.search()
+    fun bleRescan() = ble.rescan()
+    fun bleClose() {
+        ble.close()
+        sawWifi = false
+        _state.update { it.copy(bleWifiUp = false) }
+    }
+
+    fun bleSendWifi(ssid: String, password: String): Boolean {
+        val ok = ble.send(ssid, password)
+        if (ok) {
+            _state.update { it.copy(statusMessage = "Credentials sent — waiting WiFi…") }
+            startLiveLoop()
+        }
+        return ok
     }
 
     override fun onCleared() {
-        ble.release()
+        ble.close()
         super.onCleared()
     }
 
     fun selectPet(id: String) {
         if (id == _state.value.selectedPetId) return
         notifiedIds.clear()
+        fallbackStream = DemoSensorStream(id)
+        val cached = readingStore.load(id)
         _state.update {
             it.copy(
                 selectedPetId = id,
-                latest = null,
-                history = emptyList(),
+                latest = cached.lastOrNull(),
+                history = cached,
                 alerts = emptyList(),
                 healthScore = null,
                 week = emptyList(),
@@ -137,7 +182,6 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
                 val alerts = s.alerts.map {
                     if (it.id == id) it.copy(isAcknowledged = true) else it
                 }
-                // Live mode: only flip ack flags — keep API score/journal intact.
                 if (!s.demoMode && s.apiOnline) s.copy(alerts = alerts)
                 else recomputeLocal(s.copy(alerts = alerts))
             }
@@ -168,13 +212,6 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
         startLiveLoop()
     }
 
-    fun setBaseUrl(url: String) {
-        val clean = url.trim().trimEnd('/')
-        api.setBaseUrl(clean)
-        _state.update { it.copy(baseUrl = clean, statusMessage = "API URL updated") }
-        if (!_state.value.demoMode) startLiveLoop()
-    }
-
     fun refreshBaseline() {
         viewModelScope.launch {
             val petId = _state.value.selectedPetId
@@ -185,6 +222,11 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun setThemeMode(mode: ThemeMode) {
+        themePrefs.save(mode)
+        _state.update { it.copy(themeMode = mode) }
+    }
+
     private fun startLiveLoop() {
         loopJob?.cancel()
         loopJob = viewModelScope.launch {
@@ -193,70 +235,131 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun runApiPolling() {
+        var tick = 0
         while (currentCoroutineContext().isActive) {
             val petId = _state.value.selectedPetId
+            var appliedFreshCloud = false
             try {
                 if (!api.health()) error("API offline")
-                val pets = runCatching { api.listPets() }.getOrDefault(_state.value.pets)
-                val history = runCatching { api.history(petId) }.getOrDefault(emptyList())
-                val alerts = runCatching { api.alerts(petId) }.getOrDefault(emptyList())
-                val week = runCatching { api.journal(petId) }.getOrDefault(emptyList())
-                val baseline = runCatching { api.baseline(petId) }.getOrNull()
+                val refreshSlow = tick % 5 == 0
+                val pets = if (refreshSlow) {
+                    runCatching { api.listPets() }.getOrDefault(_state.value.pets)
+                } else _state.value.pets
+                val serverHistory = if (refreshSlow || _state.value.history.isEmpty()) {
+                    runCatching { api.history(petId, limit = 60) }.getOrDefault(_state.value.history)
+                } else _state.value.history
+                val alerts = if (refreshSlow) {
+                    runCatching { api.alerts(petId) }.getOrDefault(_state.value.alerts)
+                } else _state.value.alerts
+                val week = if (refreshSlow) {
+                    runCatching { api.journal(petId) }.getOrDefault(_state.value.week)
+                } else _state.value.week
+                val baseline = if (refreshSlow) {
+                    runCatching { api.baseline(petId) }.getOrNull() ?: _state.value.baseline
+                } else _state.value.baseline
                 val device = runCatching {
                     api.deviceConnectivity(_state.value.deviceSerial)
                 }.getOrNull()
-                val linkMsg = when {
-                    device?.cloud == true -> "CLOUD · MQTT up · live"
-                    device?.online == true -> "Device online · MQTT down (HTTP grace)"
-                    else -> "Live · Fastify/Postgres"
-                }
 
                 try {
                     val (reading, score) = api.latestVitals(petId)
+                    val age = System.currentTimeMillis() - reading.timestampMs
                     maybeNotify(alerts)
-                    _state.update {
-                        it.copy(
-                            pets = if (pets.isNotEmpty()) pets else it.pets,
-                            latest = reading,
-                            history = history,
-                            alerts = alerts,
-                            healthScore = score,
-                            week = week,
-                            baseline = baseline,
-                            device = device,
-                            apiOnline = true,
-                            statusMessage = linkMsg
-                        )
+                    if (age <= STALE_MS) {
+                        appliedFreshCloud = true
+                        val merged = mergeAndStore(petId, serverHistory, reading)
+                        val linkMsg = when {
+                            device?.cloud == true || _state.value.bleWifiUp -> "Live · collar"
+                            else -> "Live · cloud"
+                        }
+                        _state.update {
+                            it.copy(
+                                pets = if (pets.isNotEmpty()) pets else it.pets,
+                                latest = reading,
+                                history = merged,
+                                alerts = alerts,
+                                healthScore = score,
+                                week = week,
+                                baseline = baseline,
+                                device = device,
+                                apiOnline = true,
+                                statusMessage = linkMsg
+                            )
+                        }
+                    } else {
+                        _state.update {
+                            it.copy(
+                                pets = if (pets.isNotEmpty()) pets else it.pets,
+                                alerts = alerts,
+                                week = week,
+                                baseline = baseline,
+                                device = device,
+                                apiOnline = true,
+                                healthScore = score,
+                                statusMessage = "Cloud stale · local live vitals"
+                            )
+                        }
                     }
                 } catch (_: NoReadingYetException) {
                     _state.update {
                         it.copy(
                             pets = if (pets.isNotEmpty()) pets else it.pets,
-                            history = history,
+                            history = mergeLocal(petId, serverHistory),
                             alerts = alerts,
                             week = week,
                             baseline = baseline,
                             device = device,
                             apiOnline = true,
-                            statusMessage = if (device?.cloud == true) {
-                                "CLOUD up · waiting first reading"
-                            } else {
-                                "API online · waiting for device"
+                            statusMessage = when {
+                                device?.cloud == true || it.bleWifiUp -> "Cloud up · waiting collar reading"
+                                it.bleLinked -> "BLE linked · send WiFi in Settings"
+                                else -> "API online · local live · pair collar"
                             }
                         )
                     }
                 }
             } catch (_: Exception) {
-                // Keep last live reading; do not inject demo vitals over real data.
                 _state.update {
                     it.copy(
                         apiOnline = false,
-                        statusMessage = "API unreachable · last live reading kept"
+                        statusMessage = "API offline · local live vitals"
                     )
                 }
             }
-            delay(2000)
+
+            if (!appliedFreshCloud) {
+                applyLocalLiveTick(petId)
+            }
+
+            tick++
+            delay(1000)
         }
+    }
+
+    private fun applyLocalLiveTick(petId: String) {
+        val stream = fallbackStream ?: DemoSensorStream(petId).also { fallbackStream = it }
+        applyDemoReading(stream.sample())
+    }
+
+    private fun mergeLocal(petId: String, server: List<SensorReading>): List<SensorReading> {
+        val local = readingStore.load(petId)
+        return (local + server)
+            .distinctBy { it.timestampMs }
+            .sortedBy { it.timestampMs }
+            .takeLast(120)
+            .also { readingStore.save(petId, it) }
+    }
+
+    private fun mergeAndStore(
+        petId: String,
+        existing: List<SensorReading>,
+        latest: SensorReading
+    ): List<SensorReading> {
+        val local = readingStore.load(petId)
+        val withoutDup = (local + existing).filterNot { it.timestampMs == latest.timestampMs }
+        val merged = (withoutDup + latest).sortedBy { it.timestampMs }.takeLast(120)
+        readingStore.save(petId, merged)
+        return merged
     }
 
     private suspend fun runDemo() {
@@ -268,7 +371,7 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun applyDemoReading(reading: SensorReading) {
         _state.update { s ->
-            val history = (s.history + reading).takeLast(60)
+            val history = readingStore.append(s.selectedPetId, reading)
             val newAlerts = fusion.evaluate(reading)
             maybeNotify(newAlerts)
             val alerts = (newAlerts + s.alerts).take(50)
@@ -287,9 +390,7 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun maybeNotify(alerts: List<HealthAlert>) {
         alerts.filter { !it.isAcknowledged }.forEach { alert ->
-            if (notifiedIds.add(alert.id)) {
-                notifier.notifyCritical(alert)
-            }
+            if (notifiedIds.add(alert.id)) notifier.notifyCritical(alert)
         }
     }
 

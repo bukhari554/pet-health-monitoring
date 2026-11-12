@@ -10,13 +10,18 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
+import android.Manifest
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelUuid
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -76,22 +81,67 @@ class BleProvisioner(private val context: Context) {
     private var mtuReady = false
     private var servicesReady = false
 
+    private fun isPetHealthAdvertisement(result: ScanResult): Boolean {
+        val name = result.device.name ?: result.scanRecord?.deviceName
+        if (name != null && name.startsWith("PetHealth-", ignoreCase = true)) return true
+        val uuids = result.scanRecord?.serviceUuids ?: return false
+        return uuids.any { it.uuid == SVC }
+    }
+
+    private fun displayName(result: ScanResult): String {
+        val name = result.device.name ?: result.scanRecord?.deviceName
+        if (!name.isNullOrBlank()) return name
+        return "PetHealth-collar"
+    }
+
+    private fun rememberHit(result: ScanResult) {
+        if (!isPetHealthAdvertisement(result)) return
+        val hit = BleDeviceHit(displayName(result), result.device.address, result.rssi)
+        found[result.device.address] = hit
+        _state.update {
+            it.copy(
+                devices = found.values.sortedByDescending { d -> d.rssi },
+                message = "Found ${found.size} device(s)"
+            )
+        }
+    }
+
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val name = result.device.name ?: result.scanRecord?.deviceName ?: return
-            if (!name.startsWith("PetHealth-", ignoreCase = true)) return
-            found[result.device.address] = BleDeviceHit(name, result.device.address, result.rssi)
-            _state.update {
-                it.copy(
-                    devices = found.values.sortedByDescending { d -> d.rssi },
-                    message = "Found ${found.size} device(s)"
-                )
-            }
+            rememberHit(result)
+        }
+
+        override fun onBatchScanResults(results: MutableList<ScanResult>) {
+            results.forEach { rememberHit(it) }
         }
 
         override fun onScanFailed(errorCode: Int) {
-            _state.update { it.copy(scanning = false, message = "Scan failed ($errorCode)") }
+            val why = when (errorCode) {
+                SCAN_FAILED_ALREADY_STARTED -> "already scanning"
+                SCAN_FAILED_APPLICATION_REGISTRATION_FAILED -> "BT registration failed — toggle Bluetooth"
+                SCAN_FAILED_FEATURE_UNSUPPORTED -> "BLE scan unsupported"
+                SCAN_FAILED_INTERNAL_ERROR -> "BT internal error"
+                SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES -> "BT busy — close other BLE apps"
+                else -> "code $errorCode"
+            }
+            _state.update { it.copy(scanning = false, message = "Scan failed ($why)") }
         }
+    }
+
+    private fun hasScanPermission(): Boolean {
+        val scanOk = if (Build.VERSION.SDK_INT >= 31) {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) ==
+                PackageManager.PERMISSION_GRANTED &&
+                ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) ==
+                PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+        val locOk = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        return scanOk && locOk
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -271,16 +321,66 @@ class BleProvisioner(private val context: Context) {
     fun startScan() {
         val a = adapter
         if (a == null || !a.isEnabled) {
-            _state.update { it.copy(message = "Turn on Bluetooth") }
+            _state.update { it.copy(scanning = false, message = "Turn on Bluetooth") }
             return
         }
+        if (!hasScanPermission()) {
+            _state.update {
+                it.copy(
+                    scanning = false,
+                    message = "Allow Bluetooth + Location, then Scan again"
+                )
+            }
+            return
+        }
+        val scanner = a.bluetoothLeScanner
+        if (scanner == null) {
+            _state.update { it.copy(scanning = false, message = "BLE scanner unavailable") }
+            return
+        }
+
+        runCatching { scanner.stopScan(scanCallback) }
         found.clear()
         _state.update { it.copy(scanning = true, devices = emptyList(), message = "Scanning PetHealth…") }
+
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setReportDelay(0)
             .build()
-        a.bluetoothLeScanner?.startScan(null, settings, scanCallback)
-        main.postDelayed({ stopScan() }, 12_000)
+
+        // Prefer UUID filter; also run a second unfiltered pass so OEMs that hide UUIDs still match by name.
+        val filters = listOf(
+            ScanFilter.Builder().setServiceUuid(ParcelUuid(SVC)).build()
+        )
+        val started = runCatching {
+            scanner.startScan(filters, settings, scanCallback)
+            true
+        }.getOrElse {
+            _state.update { s -> s.copy(scanning = false, message = "Scan start error: ${it.message}") }
+            false
+        }
+        if (!started) return
+
+        // Backup unfiltered scan — some phones omit service UUID in adv but include name in scan response
+        main.postDelayed({
+            if (!_state.value.scanning) return@postDelayed
+            runCatching {
+                scanner.stopScan(scanCallback)
+                scanner.startScan(null, settings, scanCallback)
+                _state.update { it.copy(message = "Scanning (wide)…") }
+            }
+        }, 4_000)
+
+        main.postDelayed({
+            stopScan()
+            if (found.isEmpty()) {
+                _state.update {
+                    it.copy(
+                        message = "No collar found — power ESP, stay near, grant Location"
+                    )
+                }
+            }
+        }, 20_000)
     }
 
     fun stopScan() {
