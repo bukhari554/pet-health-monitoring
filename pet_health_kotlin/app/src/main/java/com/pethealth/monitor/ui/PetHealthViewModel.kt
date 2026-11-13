@@ -262,14 +262,21 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
                 }.getOrNull()
 
                 try {
-                    val (reading, score) = api.latestVitals(petId)
-                    val age = System.currentTimeMillis() - reading.timestampMs
+                    val vitals = api.latestVitals(petId)
+                    val reading = vitals.reading
+                    val score = vitals.healthScore
+                    val age = vitals.ageMs
+                        ?: (System.currentTimeMillis() - reading.timestampMs)
                     maybeNotify(alerts)
-                    if (age <= STALE_MS) {
+                    val collarLive = vitals.live ||
+                        (vitals.deviceOnline && age <= STALE_MS) ||
+                        (device?.online == true && age <= STALE_MS)
+                    val merged = mergeAndStore(petId, serverHistory, reading)
+                    if (collarLive) {
                         appliedFreshCloud = true
-                        val merged = mergeAndStore(petId, serverHistory, reading)
                         val linkMsg = when {
-                            device?.cloud == true || _state.value.bleWifiUp -> "Live · collar"
+                            vitals.cloud || device?.cloud == true || _state.value.bleWifiUp ->
+                                "Live · collar"
                             else -> "Live · cloud"
                         }
                         _state.update {
@@ -287,16 +294,24 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
                             )
                         }
                     } else {
+                        // Offline / stale: freeze last real reading — never invent vitals.
+                        val ageLabel = formatAge(age)
                         _state.update {
                             it.copy(
                                 pets = if (pets.isNotEmpty()) pets else it.pets,
+                                latest = reading,
+                                history = merged,
                                 alerts = alerts,
                                 week = week,
                                 baseline = baseline,
                                 device = device,
                                 apiOnline = true,
                                 healthScore = score,
-                                statusMessage = "Cloud stale · local live vitals"
+                                statusMessage = when {
+                                    !vitals.deviceOnline && device?.online != true ->
+                                        "Offline · last reading $ageLabel"
+                                    else -> "Stale · last reading $ageLabel"
+                                }
                             )
                         }
                     }
@@ -311,9 +326,11 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
                             device = device,
                             apiOnline = true,
                             statusMessage = when {
-                                device?.cloud == true || it.bleWifiUp -> "Cloud up · waiting collar reading"
+                                device?.cloud == true || it.bleWifiUp ->
+                                    "Cloud up · waiting collar reading"
                                 it.bleLinked -> "BLE linked · send WiFi in Settings"
-                                else -> "API online · local live · pair collar"
+                                device?.online == true -> "Online · waiting first reading"
+                                else -> "Offline · no collar readings yet"
                             }
                         )
                     }
@@ -322,17 +339,28 @@ class PetHealthViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update {
                     it.copy(
                         apiOnline = false,
-                        statusMessage = "API offline · local live vitals"
+                        statusMessage = "API offline · showing last saved reading"
                     )
                 }
             }
 
-            if (!appliedFreshCloud) {
+            // Fake live stream only in explicit Demo mode — never while "offline".
+            if (!appliedFreshCloud && _state.value.demoMode) {
                 applyLocalLiveTick(petId)
             }
 
             tick++
             delay(1000)
+        }
+    }
+
+    private fun formatAge(ageMs: Long): String {
+        val sec = (ageMs / 1000).coerceAtLeast(0)
+        return when {
+            sec < 60 -> "${sec}s ago"
+            sec < 3600 -> "${sec / 60}m ago"
+            sec < 86400 -> "${sec / 3600}h ago"
+            else -> "${sec / 86400}d ago"
         }
     }
 

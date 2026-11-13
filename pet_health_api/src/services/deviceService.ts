@@ -1,6 +1,8 @@
 import { query } from '../db/pool.js';
 
 export const OFFLINE_GRACE_MS = 20_000;
+/** Reading older than this is not "live" — clients must not invent vitals. */
+export const LIVE_READING_MS = 30_000;
 
 export interface DeviceRow {
   serial: string;
@@ -28,6 +30,15 @@ function map(row: Record<string, unknown>): DeviceRow {
 
 export async function getDevice(serial: string) {
   const res = await query(`SELECT * FROM devices WHERE serial = $1`, [serial]);
+  return res.rows[0] ? map(res.rows[0] as Record<string, unknown>) : null;
+}
+
+export async function getDeviceByPetId(petId: string) {
+  await markStaleOffline();
+  const res = await query(
+    `SELECT * FROM devices WHERE pet_id = $1 ORDER BY last_seen DESC NULLS LAST LIMIT 1`,
+    [petId],
+  );
   return res.rows[0] ? map(res.rows[0] as Record<string, unknown>) : null;
 }
 

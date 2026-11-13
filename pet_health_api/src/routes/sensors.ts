@@ -2,6 +2,11 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config.js';
 import {
+  getDeviceByPetId,
+  LIVE_READING_MS,
+  markStaleOffline,
+} from '../services/deviceService.js';
+import {
   ingestReading,
   latestReading,
   latestScore,
@@ -56,10 +61,32 @@ export async function sensorRoutes(app: FastifyInstance) {
   app.get<{ Params: { petId: string } }>(
     '/pets/:petId/vitals/latest',
     async (req, reply) => {
+      await markStaleOffline();
       const reading = await latestReading(req.params.petId);
       if (!reading) return reply.notFound('No readings yet');
       const score = await latestScore(req.params.petId);
-      return { reading, healthScore: score };
+      const device = await getDeviceByPetId(req.params.petId);
+      const recordedAt = String(
+        (reading as { recordedAt?: string }).recordedAt ?? '',
+      );
+      const recordedMs = recordedAt ? Date.parse(recordedAt) : NaN;
+      const ageMs = Number.isFinite(recordedMs) ? Date.now() - recordedMs : null;
+      const deviceOnline = Boolean(device?.online);
+      const cloud = Boolean(device?.online && device?.mqttUp);
+      // Live only when collar is online AND reading is fresh — stops stale/offline UI drift.
+      const live =
+        deviceOnline && ageMs != null && ageMs >= 0 && ageMs <= LIVE_READING_MS;
+      return {
+        reading,
+        healthScore: score,
+        live,
+        ageMs,
+        liveWithinMs: LIVE_READING_MS,
+        deviceOnline,
+        cloud,
+        deviceSerial: device?.serial ?? null,
+        lastSeen: device?.lastSeen ?? null,
+      };
     },
   );
 

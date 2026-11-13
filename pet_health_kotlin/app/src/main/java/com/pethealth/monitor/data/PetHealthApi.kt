@@ -45,7 +45,17 @@ class PetHealthApi(private var baseUrl: String = ApiConfig.DEFAULT_BASE_URL) {
 
     class NoReadingYetException : Exception("No readings yet")
 
-    suspend fun latestVitals(petId: String): Pair<SensorReading, HealthScore?> =
+    data class LatestVitals(
+        val reading: SensorReading,
+        val healthScore: HealthScore?,
+        /** Backend authority: only true when collar online + fresh reading. */
+        val live: Boolean,
+        val ageMs: Long?,
+        val deviceOnline: Boolean,
+        val cloud: Boolean
+    )
+
+    suspend fun latestVitals(petId: String): LatestVitals =
         withContext(Dispatchers.IO) {
             val raw = try {
                 get("/pets/$petId/vitals/latest")
@@ -56,7 +66,23 @@ class PetHealthApi(private var baseUrl: String = ApiConfig.DEFAULT_BASE_URL) {
             val o = JSONObject(raw)
             val reading = parseReading(o.getJSONObject("reading"))
             val score = o.optJSONObject("healthScore")?.let { parseScore(it) }
-            reading to score
+            val ageMs = if (o.isNull("ageMs")) null else o.optLong("ageMs")
+            val deviceOnline = o.optBoolean("deviceOnline", false)
+            val cloud = o.optBoolean("cloud", false)
+            val live = if (o.has("live")) {
+                o.optBoolean("live", false)
+            } else {
+                // Older API fallback: never treat as live without explicit flag.
+                false
+            }
+            LatestVitals(
+                reading = reading,
+                healthScore = score,
+                live = live,
+                ageMs = ageMs,
+                deviceOnline = deviceOnline,
+                cloud = cloud
+            )
         }
 
     suspend fun history(petId: String, limit: Int = 60): List<SensorReading> =
